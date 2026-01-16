@@ -493,13 +493,19 @@ impl InnerBuilder {
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
 
+        let cpu_parallelism = get_num_compute_intensive_cpus().max(1);
+        let shard_parallelism = (*LANCE_FTS_NUM_SHARDS).max(1);
+        // Indexing already shards work across workers, so limit per-worker fanout to avoid
+        // oversubscribing the CPU pool.
+        let per_worker_parallelism = (cpu_parallelism / shard_parallelism).max(1);
+
         let mut batches = stream::iter(posting_lists)
             .map(move |posting_list| {
                 let docs = docs_for_batches.clone();
                 let schema = schema_for_batches.clone();
                 spawn_cpu(move || posting_list.to_batch_with_docs(&docs, schema))
             })
-            .buffered(get_num_compute_intensive_cpus());
+            .buffered(per_worker_parallelism);
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
