@@ -19,7 +19,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{iter_str_array, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -493,25 +493,28 @@ impl InnerBuilder {
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
 
-        let cpu_parallelism = get_num_compute_intensive_cpus().max(1);
-        let shard_parallelism = (*LANCE_FTS_NUM_SHARDS).max(1);
-        // Indexing already shards work across workers, so limit per-worker fanout to avoid
-        // oversubscribing the CPU pool.
-        let per_worker_parallelism = (cpu_parallelism / shard_parallelism).max(1);
-
-        let mut batches = stream::iter(posting_lists)
-            .map(move |posting_list| {
-                let docs = docs_for_batches.clone();
-                let schema = schema_for_batches.clone();
-                spawn_cpu(move || posting_list.to_batch_with_docs(&docs, schema))
-            })
-            .buffered(per_worker_parallelism);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
+        let producer = spawn_cpu(move || {
+            for posting_list in posting_lists {
+                let batch =
+                    posting_list.to_batch_with_docs(&docs_for_batches, schema_for_batches.clone());
+                let is_err = batch.is_err();
+                if tx.blocking_send(batch).is_err() {
+                    break;
+                }
+                if is_err {
+                    break;
+                }
+            }
+            Ok(())
+        });
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
         let mut buffer = Vec::new();
         let mut size_sum = 0;
-        while let Some(batch) = batches.try_next().await? {
+        while let Some(batch) = rx.recv().await {
+            let batch = batch?;
             num_posting_lists += 1;
             size_sum += batch.get_array_memory_size();
             buffer.push(batch);
@@ -538,6 +541,7 @@ impl InnerBuilder {
             writer.write_record_batch(batch).await?;
         }
 
+        producer.await?;
         writer.finish().await?;
         Ok(())
     }
