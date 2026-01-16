@@ -490,14 +490,14 @@ impl InnerBuilder {
             self.with_position
         );
         let schema = inverted_list_schema(self.with_position);
+        let docs_for_batches = docs.clone();
+        let schema_for_batches = schema.clone();
 
         let mut batches = stream::iter(posting_lists)
-            .map(|posting_list| {
-                let block_max_scores = docs.calculate_block_max_scores(
-                    posting_list.doc_ids.iter(),
-                    posting_list.frequencies.iter(),
-                );
-                spawn_cpu(move || posting_list.to_batch(block_max_scores))
+            .map(move |posting_list| {
+                let docs = docs_for_batches.clone();
+                let schema = schema_for_batches.clone();
+                spawn_cpu(move || posting_list.to_batch_with_docs(&docs, schema))
             })
             .buffered(get_num_compute_intensive_cpus());
 
