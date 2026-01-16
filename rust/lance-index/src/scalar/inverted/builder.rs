@@ -493,7 +493,8 @@ impl InnerBuilder {
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
+        let channel_capacity = get_num_compute_intensive_cpus().max(1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(channel_capacity);
         let producer = spawn_cpu(move || {
             for posting_list in posting_lists {
                 let batch =
