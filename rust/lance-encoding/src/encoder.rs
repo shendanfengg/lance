@@ -394,6 +394,29 @@ impl StructuralEncodingStrategy {
 
         // Check if field is marked as blob
         if field.is_blob() {
+            if self.version >= LanceFileVersion::V2_2 {
+                match data_type {
+                    DataType::Binary | DataType::LargeBinary | DataType::Struct(_) => {
+                        return Ok(Box::new(BlobV2StructuralEncoder::new(
+                            field,
+                            column_index.next_column_index(field.id as u32),
+                            options,
+                            self.compression_strategy.clone(),
+                        )?));
+                    }
+                    _ => {
+                        return Err(Error::InvalidInput {
+                            source: format!(
+                                "Blob encoding only supports Binary/LargeBinary or Struct, got {}",
+                                data_type
+                            )
+                            .into(),
+                            location: location!(),
+                        });
+                    }
+                }
+            }
+
             match data_type {
                 DataType::Binary | DataType::LargeBinary => {
                     return Ok(Box::new(BlobStructuralEncoder::new(
@@ -403,24 +426,16 @@ impl StructuralEncodingStrategy {
                         self.compression_strategy.clone(),
                     )?));
                 }
-                DataType::Struct(_) if self.version >= LanceFileVersion::V2_2 => {
-                    return Ok(Box::new(BlobV2StructuralEncoder::new(
-                        field,
-                        column_index.next_column_index(field.id as u32),
-                        options,
-                        self.compression_strategy.clone(),
-                    )?));
-                }
                 DataType::Struct(_) => {
                     return Err(Error::InvalidInput {
-                        source: "Blob v2 struct input requires file version >= 2.2".into(),
+                        source: "Blob struct input requires file version >= 2.2".into(),
                         location: location!(),
                     });
                 }
                 _ => {
                     return Err(Error::InvalidInput {
                         source: format!(
-                            "Blob encoding only supports Binary/LargeBinary or v2 Struct, got {}",
+                            "Blob encoding only supports Binary/LargeBinary, got {}",
                             data_type
                         )
                         .into(),
