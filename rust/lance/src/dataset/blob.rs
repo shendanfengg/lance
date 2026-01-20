@@ -598,11 +598,10 @@ pub(super) async fn take_blobs(
     let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
     let blob_field_id = blob_field_id as u32;
 
-    match dataset.blob_version() {
+    match blob_version_from_descriptions(descriptions)? {
         BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
-        BlobVersion::V2 => {
-            collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs).await
-        }
+        BlobVersion::V2 => collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs)
+            .await,
     }
 }
 
@@ -645,7 +644,7 @@ pub async fn take_blobs_by_addresses(
     let row_addrs_result = description_and_addr.column(1).as_primitive::<UInt64Type>();
     let blob_field_id = blob_field_id as u32;
 
-    match dataset.blob_version() {
+    match blob_version_from_descriptions(descriptions)? {
         BlobVersion::V1 => {
             collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs_result)
         }
@@ -653,6 +652,30 @@ pub async fn take_blobs_by_addresses(
             collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs_result).await
         }
     }
+}
+
+fn blob_version_from_descriptions(descriptions: &StructArray) -> Result<BlobVersion> {
+    let fields = descriptions.fields();
+    if fields.len() == 2 && fields[0].name() == "position" && fields[1].name() == "size" {
+        return Ok(BlobVersion::V1);
+    }
+    if fields.len() == 5
+        && fields[0].name() == "kind"
+        && fields[1].name() == "position"
+        && fields[2].name() == "size"
+        && fields[3].name() == "blob_id"
+        && fields[4].name() == "blob_uri"
+    {
+        return Ok(BlobVersion::V2);
+    }
+    Err(Error::InvalidInput {
+        source: format!(
+            "Unrecognized blob descriptions schema: expected v1 (position,size) or v2 (kind,position,size,blob_id,blob_uri) but got {:?}",
+            fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+        )
+        .into(),
+        location: location!(),
+    })
 }
 
 fn collect_blob_files_v1(
