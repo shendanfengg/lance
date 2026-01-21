@@ -4,7 +4,7 @@
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{BlobVersion, Schema};
 use lance_core::Error;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -18,7 +18,7 @@ use snafu::location;
 use std::borrow::Cow;
 use uuid::Uuid;
 
-use crate::dataset::blob::{preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor};
+use crate::dataset::blob::{preprocess_blob_batches, BlobPreprocessor};
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::write::do_write_fragments;
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
@@ -139,7 +139,6 @@ impl<'a> FragmentCreateBuilder<'a> {
         let filename = format!("{}.lance", data_file_key);
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
-        let has_blob_v2 = schema_has_blob_v2(&schema);
         let obj_writer = object_store.create(&full_path).await?;
         let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
@@ -150,15 +149,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             },
         )?;
 
-        let mut preprocessor = if has_blob_v2 {
-            Some(BlobPreprocessor::new(
-                object_store.as_ref().clone(),
-                base_path.child(DATA_DIR),
-                data_file_key.clone(),
-            ))
-        } else {
-            None
-        };
+        let mut preprocessor: Option<BlobPreprocessor> = None;
 
         let (major, minor) = writer.version().to_numbers();
 
@@ -227,6 +218,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             stream,
             params.into_owned(),
             version,
+            BlobVersion::V1,
             None, // Fragment creation doesn't use target_bases
         )
         .await

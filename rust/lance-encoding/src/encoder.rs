@@ -19,7 +19,7 @@ use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::{BlobVersion, Field, Schema};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::bit::{is_pwr_two, pad_bytes_to};
 use lance_core::{Error, Result};
@@ -302,6 +302,7 @@ pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEnco
 pub fn default_encoding_strategy_with_params(
     version: LanceFileVersion,
     params: CompressionParams,
+    blob_version: BlobVersion,
 ) -> Result<Box<dyn FieldEncodingStrategy>> {
     match version.resolve() {
         LanceFileVersion::Legacy | LanceFileVersion::V2_0 => Err(Error::invalid_input(
@@ -309,11 +310,18 @@ pub fn default_encoding_strategy_with_params(
             location!(),
         )),
         _ => {
+            if blob_version != BlobVersion::V1 && version < LanceFileVersion::V2_2 {
+                return Err(Error::InvalidInput {
+                    source: "Blob version v2 requires file version >= 2.2".into(),
+                    location: location!(),
+                });
+            }
             let compression_strategy =
                 Arc::new(DefaultCompressionStrategy::with_params(params).with_version(version));
             Ok(Box::new(StructuralEncodingStrategy {
                 compression_strategy,
                 version,
+                blob_version,
             }))
         }
     }
@@ -324,6 +332,7 @@ pub fn default_encoding_strategy_with_params(
 pub struct StructuralEncodingStrategy {
     pub compression_strategy: Arc<dyn CompressionStrategy>,
     pub version: LanceFileVersion,
+    pub blob_version: BlobVersion,
 }
 
 // For some reason, clippy thinks we can add Default to the above derive but
@@ -334,6 +343,7 @@ impl Default for StructuralEncodingStrategy {
         Self {
             compression_strategy: Arc::new(DefaultCompressionStrategy::new()),
             version: LanceFileVersion::default(),
+            blob_version: BlobVersion::V1,
         }
     }
 }
@@ -343,6 +353,18 @@ impl StructuralEncodingStrategy {
         Self {
             compression_strategy: Arc::new(DefaultCompressionStrategy::new().with_version(version)),
             version,
+            blob_version: BlobVersion::V1,
+        }
+    }
+
+    pub fn with_version_and_blob_version(
+        version: LanceFileVersion,
+        blob_version: BlobVersion,
+    ) -> Self {
+        Self {
+            compression_strategy: Arc::new(DefaultCompressionStrategy::new().with_version(version)),
+            version,
+            blob_version,
         }
     }
 
@@ -394,7 +416,14 @@ impl StructuralEncodingStrategy {
 
         // Check if field is marked as blob
         if field.is_blob() {
-            if self.version >= LanceFileVersion::V2_2 {
+            if self.blob_version == BlobVersion::V2 && self.version < LanceFileVersion::V2_2 {
+                return Err(Error::InvalidInput {
+                    source: "Blob v2 requires file version >= 2.2".into(),
+                    location: location!(),
+                });
+            }
+
+            if self.blob_version == BlobVersion::V2 {
                 match data_type {
                     DataType::Binary | DataType::LargeBinary | DataType::Struct(_) => {
                         return Ok(Box::new(BlobV2StructuralEncoder::new(
@@ -428,7 +457,7 @@ impl StructuralEncodingStrategy {
                 }
                 DataType::Struct(_) => {
                     return Err(Error::InvalidInput {
-                        source: "Blob struct input requires file version >= 2.2".into(),
+                        source: "Blob struct input requires blob version v2".into(),
                         location: location!(),
                     });
                 }
@@ -822,24 +851,35 @@ mod tests {
         );
 
         // Test with V2.1 - should succeed
-        let strategy =
-            default_encoding_strategy_with_params(LanceFileVersion::V2_1, params.clone())
-                .expect("Should succeed for V2.1");
+        let strategy = default_encoding_strategy_with_params(
+            LanceFileVersion::V2_1,
+            params.clone(),
+            BlobVersion::V1,
+        )
+        .expect("Should succeed for V2.1");
 
         // Verify it's a StructuralEncodingStrategy
         assert!(format!("{:?}", strategy).contains("StructuralEncodingStrategy"));
         assert!(format!("{:?}", strategy).contains("DefaultCompressionStrategy"));
 
         // Test with V2.0 - should fail
-        let err = default_encoding_strategy_with_params(LanceFileVersion::V2_0, params.clone())
-            .expect_err("Should fail for V2.0");
+        let err = default_encoding_strategy_with_params(
+            LanceFileVersion::V2_0,
+            params.clone(),
+            BlobVersion::V1,
+        )
+        .expect_err("Should fail for V2.0");
         assert!(err
             .to_string()
             .contains("only supported in Lance file version 2.1"));
 
         // Test with Legacy - should fail
-        let err = default_encoding_strategy_with_params(LanceFileVersion::Legacy, params)
-            .expect_err("Should fail for Legacy");
+        let err = default_encoding_strategy_with_params(
+            LanceFileVersion::Legacy,
+            params,
+            BlobVersion::V1,
+        )
+        .expect_err("Should fail for Legacy");
         assert!(err
             .to_string()
             .contains("only supported in Lance file version 2.1"));

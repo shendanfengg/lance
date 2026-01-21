@@ -930,6 +930,7 @@ impl MergeInsertJob {
                         &write_schema,
                         &dataset.base,
                         data_storage_version,
+                        dataset.blob_version(),
                     )
                     .await?;
 

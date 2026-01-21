@@ -338,10 +338,6 @@ impl BlobPreprocessor {
     }
 }
 
-pub fn schema_has_blob_v2(schema: &lance_core::datatypes::Schema) -> bool {
-    schema.fields.iter().any(|f| f.is_blob_v2())
-}
-
 pub async fn preprocess_blob_batches(
     batches: &[RecordBatch],
     pre: &mut BlobPreprocessor,
@@ -600,8 +596,9 @@ pub(super) async fn take_blobs(
 
     match blob_version_from_descriptions(descriptions)? {
         BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
-        BlobVersion::V2 => collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs)
-            .await,
+        BlobVersion::V2 => {
+            collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs).await
+        }
     }
 }
 
@@ -1104,7 +1101,11 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
 
-        let params = WriteParams::with_storage_version(LanceFileVersion::V2_2);
+        let params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            blob_version: Some(lance_core::datatypes::BlobVersion::V2),
+            ..Default::default()
+        };
         let dataset = Arc::new(
             Dataset::write(reader, &test_dir, Some(params))
                 .await

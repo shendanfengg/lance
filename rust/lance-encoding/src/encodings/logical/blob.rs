@@ -27,6 +27,8 @@ use crate::{
     repdef::{DefinitionInterpretation, RepDefBuilder},
 };
 use lance_core::datatypes::BlobKind;
+#[cfg(test)]
+use lance_core::datatypes::BlobVersion;
 
 /// Blob structural encoder - stores large binary data in external buffers
 ///
@@ -801,7 +803,9 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default()
+                .with_min_file_version(LanceFileVersion::V2_2)
+                .with_blob_version(BlobVersion::V2),
             blob_metadata,
         )
         .await;
@@ -864,7 +868,9 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default()
+                .with_min_file_version(LanceFileVersion::V2_2)
+                .with_blob_version(BlobVersion::V2),
             blob_metadata,
         )
         .await;
@@ -924,7 +930,9 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default()
+                .with_min_file_version(LanceFileVersion::V2_2)
+                .with_blob_version(BlobVersion::V2),
             blob_metadata,
         )
         .await;

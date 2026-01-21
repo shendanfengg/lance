@@ -33,7 +33,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
-use crate::dataset::blob::{preprocess_blob_batches, schema_has_blob_v2, BlobPreprocessor};
+use crate::dataset::blob::{preprocess_blob_batches, BlobPreprocessor};
 use crate::session::Session;
 use crate::Dataset;
 
@@ -42,14 +42,6 @@ use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 use super::DATA_DIR;
-
-pub(super) fn blob_version_for(storage_version: LanceFileVersion) -> BlobVersion {
-    if storage_version >= LanceFileVersion::V2_2 {
-        BlobVersion::V2
-    } else {
-        BlobVersion::V1
-    }
-}
 
 mod commit;
 pub mod delete;
@@ -252,6 +244,13 @@ pub struct WriteParams {
     /// These will be resolved to IDs when the write operation executes.
     /// Resolution happens at builder execution time when dataset context is available.
     pub target_base_names_or_paths: Option<Vec<String>>,
+
+    /// If set and this write creates a new dataset, the blob encoding version to persist
+    /// into the dataset config as `lance.blob.version`.
+    ///
+    /// For existing datasets, the blob version is determined by the dataset config and
+    /// must not be changed by writes.
+    pub blob_version: Option<BlobVersion>,
 }
 
 impl Default for WriteParams {
@@ -276,6 +275,7 @@ impl Default for WriteParams {
             initial_bases: None,
             target_bases: None,
             target_base_names_or_paths: None,
+            blob_version: None,
         }
     }
 }
@@ -376,6 +376,7 @@ pub async fn write_fragments(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_write_fragments(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
@@ -383,6 +384,7 @@ pub async fn do_write_fragments(
     data: SendableRecordBatchStream,
     params: WriteParams,
     storage_version: LanceFileVersion,
+    blob_version: BlobVersion,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<Vec<Fragment>> {
     let adapter = SchemaAdapter::new(data.schema());
@@ -404,6 +406,7 @@ pub async fn do_write_fragments(
         base_dir,
         schema,
         storage_version,
+        blob_version,
         target_bases_info,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
@@ -571,9 +574,10 @@ pub async fn write_fragments_internal(
     base_dir: &Path,
     schema: Schema,
     data: SendableRecordBatchStream,
-    mut params: WriteParams,
+    params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
+    let mut params = params;
     let adapter = SchemaAdapter::new(data.schema());
 
     let (data, converted_schema) = if adapter.requires_physical_conversion() {
@@ -637,14 +641,30 @@ pub async fn write_fragments_internal(
         (converted_schema, params.storage_version_or_default())
     };
 
-    let target_blob_version = blob_version_for(storage_version);
-    if let Some(dataset) = dataset {
+    let requested_blob_version = params.blob_version;
+
+    let target_blob_version = requested_blob_version
+        .or_else(|| dataset.map(|d| d.blob_version()))
+        .unwrap_or(BlobVersion::V1);
+
+    if storage_version < LanceFileVersion::V2_2 && target_blob_version == BlobVersion::V2 {
+        return Err(Error::InvalidInput {
+            source: format!(
+                "Blob version v2 requires file version >= 2.2 (got {:?})",
+                storage_version
+            )
+            .into(),
+            location: location!(),
+        });
+    }
+
+    if let (Some(dataset), Some(requested_blob_version)) = (dataset, requested_blob_version) {
         let existing_version = dataset.blob_version();
-        if existing_version != target_blob_version {
+        if existing_version != requested_blob_version {
             return Err(Error::InvalidInput {
                 source: format!(
                     "Blob column version mismatch. Existing dataset uses {:?} but requested write requires {:?}. Changing blob version is not allowed",
-                    existing_version, target_blob_version
+                    existing_version, requested_blob_version
                 )
                 .into(),
                 location: location!(),
@@ -659,6 +679,7 @@ pub async fn write_fragments_internal(
         data,
         params,
         storage_version,
+        target_blob_version,
         target_bases_info,
     )
     .await?;
@@ -774,8 +795,18 @@ pub async fn open_writer(
     schema: &Schema,
     base_dir: &Path,
     storage_version: LanceFileVersion,
+    blob_version: BlobVersion,
 ) -> Result<Box<dyn GenericWriter>> {
-    open_writer_with_options(object_store, schema, base_dir, storage_version, true, None).await
+    open_writer_with_options(
+        object_store,
+        schema,
+        base_dir,
+        storage_version,
+        blob_version,
+        true,
+        None,
+    )
+    .await
 }
 
 pub async fn open_writer_with_options(
@@ -783,6 +814,7 @@ pub async fn open_writer_with_options(
     schema: &Schema,
     base_dir: &Path,
     storage_version: LanceFileVersion,
+    blob_version: BlobVersion,
     add_data_dir: bool,
     base_id: Option<u32>,
 ) -> Result<Box<dyn GenericWriter>> {
@@ -815,19 +847,21 @@ pub async fn open_writer_with_options(
             writer,
             schema.clone(),
             FileWriterOptions {
+                blob_version: (blob_version == BlobVersion::V2).then_some(blob_version),
                 format_version: Some(storage_version),
                 ..Default::default()
             },
         )?;
-        let preprocessor = if schema_has_blob_v2(schema) {
-            Some(BlobPreprocessor::new(
-                object_store.clone(),
-                data_dir.clone(),
-                data_file_key.clone(),
-            ))
-        } else {
-            None
-        };
+        let preprocessor =
+            if storage_version >= LanceFileVersion::V2_2 && blob_version == BlobVersion::V2 {
+                Some(BlobPreprocessor::new(
+                    object_store.clone(),
+                    data_dir.clone(),
+                    data_file_key.clone(),
+                ))
+            } else {
+                None
+            };
         let writer_adapter = V2WriterAdapter {
             writer: file_writer,
             path: filename,
@@ -859,6 +893,7 @@ struct WriterGenerator {
     base_dir: Path,
     schema: Schema,
     storage_version: LanceFileVersion,
+    blob_version: BlobVersion,
     /// Target base information (if writing to specific bases)
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     /// Counter for round-robin selection
@@ -871,6 +906,7 @@ impl WriterGenerator {
         base_dir: &Path,
         schema: &Schema,
         storage_version: LanceFileVersion,
+        blob_version: BlobVersion,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
     ) -> Self {
         Self {
@@ -878,6 +914,7 @@ impl WriterGenerator {
             base_dir: base_dir.clone(),
             schema: schema.clone(),
             storage_version,
+            blob_version,
             target_bases_info,
             next_base_index: AtomicUsize::new(0),
         }
@@ -904,16 +941,20 @@ impl WriterGenerator {
                 &self.schema,
                 &base_info.base_dir,
                 self.storage_version,
+                self.blob_version,
                 base_info.is_dataset_root,
                 Some(base_info.base_id),
             )
             .await?
         } else {
-            open_writer(
+            open_writer_with_options(
                 &self.object_store,
                 &self.schema,
                 &self.base_dir,
                 self.storage_version,
+                self.blob_version,
+                true,
+                None,
             )
             .await?
         };
@@ -1546,6 +1587,7 @@ mod tests {
             &base_dir,
             &schema,
             LanceFileVersion::Stable,
+            BlobVersion::V1,
             Some(target_bases),
         );
 
@@ -1590,6 +1632,7 @@ mod tests {
             &schema,
             &base_dir,
             LanceFileVersion::Stable,
+            BlobVersion::V1,
             false, // Don't add /data
             None,
         )
@@ -1656,6 +1699,7 @@ mod tests {
             &Path::from("default"),
             &schema,
             LanceFileVersion::Stable,
+            BlobVersion::V1,
             Some(target_bases),
         );
 

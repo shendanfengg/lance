@@ -755,6 +755,7 @@ mod tests {
     use super::*;
     use crate::blob::{blob_field, BlobArrayBuilder};
     use crate::{
+        dataset::write::InsertBuilder,
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         index::vector::VectorIndexParams,
     };
@@ -1122,19 +1123,19 @@ mod tests {
         let fixture = MockDatasetFixture::try_new().unwrap();
 
         // First version: write a packed blob (sidecar .blob file).
-        Dataset::write(
-            blob_v2_batch(100 * 1024),
-            &fixture.dataset_path,
-            Some(WriteParams {
-                store_params: Some(fixture.os_params()),
-                commit_handler: Some(Arc::new(RenameCommitHandler)),
-                mode: WriteMode::Create,
-                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let write_params = WriteParams {
+            store_params: Some(fixture.os_params()),
+            commit_handler: Some(Arc::new(RenameCommitHandler)),
+            mode: WriteMode::Create,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            blob_version: Some(lance_core::datatypes::BlobVersion::V2),
+            ..Default::default()
+        };
+        InsertBuilder::new(&fixture.dataset_path)
+            .with_params(&write_params)
+            .execute_stream(blob_v2_batch(100 * 1024))
+            .await
+            .unwrap();
         assert_gt!(fixture.count_blob_files().await.unwrap(), 0);
 
         // Second version: overwrite with an inline blob (no sidecar).
@@ -1167,19 +1168,19 @@ mod tests {
     async fn cleanup_recent_blob_v2_sidecar_files_when_verified() {
         let fixture = MockDatasetFixture::try_new().unwrap();
 
-        Dataset::write(
-            blob_v2_batch(100 * 1024),
-            &fixture.dataset_path,
-            Some(WriteParams {
-                store_params: Some(fixture.os_params()),
-                commit_handler: Some(Arc::new(RenameCommitHandler)),
-                mode: WriteMode::Create,
-                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let write_params = WriteParams {
+            store_params: Some(fixture.os_params()),
+            commit_handler: Some(Arc::new(RenameCommitHandler)),
+            mode: WriteMode::Create,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            blob_version: Some(lance_core::datatypes::BlobVersion::V2),
+            ..Default::default()
+        };
+        InsertBuilder::new(&fixture.dataset_path)
+            .with_params(&write_params)
+            .execute_stream(blob_v2_batch(100 * 1024))
+            .await
+            .unwrap();
 
         Dataset::write(
             blob_v2_batch(1024),
