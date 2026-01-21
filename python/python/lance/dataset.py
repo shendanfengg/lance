@@ -5540,6 +5540,7 @@ def write_dataset(
     data_storage_version: Optional[
         Literal["stable", "2.0", "2.1", "2.2", "next", "legacy", "0.1"]
     ] = None,
+    blob_version: Optional[Literal["v1", "v2"]] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = True,
     enable_stable_row_ids: bool = False,
@@ -5801,6 +5802,9 @@ def write_dataset(
         "initial_bases": initial_bases,
         "target_bases": target_bases,
     }
+
+    if blob_version is not None:
+        params["blob_version"] = blob_version
 
     # Add storage_options_provider if created from namespace
     if storage_options_provider is not None:
