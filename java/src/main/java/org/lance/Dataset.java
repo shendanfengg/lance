@@ -18,6 +18,8 @@ import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
 import org.lance.index.Index;
+import org.lance.index.IndexCriteria;
+import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
@@ -33,6 +35,7 @@ import org.lance.operation.UpdateMap;
 import org.lance.schema.ColumnAlteration;
 import org.lance.schema.LanceSchema;
 import org.lance.schema.SqlExpressions;
+import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -144,7 +147,6 @@ public class Dataset implements Closeable {
               params.getDataStorageVersion(),
               params.getEnableV2ManifestPaths(),
               params.getStorageOptions(),
-              params.getS3CredentialsRefreshOffsetSeconds(),
               params.getInitialBases(),
               params.getTargetBases());
       dataset.allocator = allocator;
@@ -206,7 +208,6 @@ public class Dataset implements Closeable {
             params.getEnableV2ManifestPaths(),
             params.getStorageOptions(),
             Optional.ofNullable(storageOptionsProvider),
-            params.getS3CredentialsRefreshOffsetSeconds(),
             params.getInitialBases(),
             params.getTargetBases());
     dataset.allocator = allocator;
@@ -224,7 +225,6 @@ public class Dataset implements Closeable {
       Optional<String> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases);
 
@@ -239,7 +239,6 @@ public class Dataset implements Closeable {
       Optional<String> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases);
 
@@ -255,7 +254,6 @@ public class Dataset implements Closeable {
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
       Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases);
 
@@ -335,8 +333,7 @@ public class Dataset implements Closeable {
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
             options.getSerializedManifest(),
-            options.getStorageOptionsProvider(),
-            options.getS3CredentialsRefreshOffsetSeconds());
+            options.getStorageOptionsProvider());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -350,8 +347,7 @@ public class Dataset implements Closeable {
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
       Optional<ByteBuffer> serializedManifest,
-      Optional<StorageOptionsProvider> storageOptionsProvider,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds);
+      Optional<StorageOptionsProvider> storageOptionsProvider);
 
   /**
    * Creates a builder for opening a dataset.
@@ -456,7 +452,7 @@ public class Dataset implements Closeable {
    * @return A new instance of {@link Dataset} linked to committed version.
    */
   public Dataset commitTransaction(Transaction transaction) {
-    return commitTransaction(transaction, false);
+    return commitTransaction(transaction, false, true);
   }
 
   /**
@@ -465,12 +461,18 @@ public class Dataset implements Closeable {
    *
    * @param transaction The transaction to commit
    * @param detached If true, the commit will not be part of the main dataset lineage.
+   * @param enableV2ManifestPaths If true, and this is a new dataset, uses the new V2 manifest
+   *     paths. These paths provide more efficient opening of datasets with many versions on object
+   *     stores. This parameter has no effect if the dataset already exists. To migrate an existing
+   *     dataset, instead use the `migrateManifestPathsV2` method. Default is true. WARNING: turning
+   *     this on will make the dataset unreadable for older versions of Lance (prior to 0.17.0).
    * @return A new instance of {@link Dataset} linked to committed version.
    */
-  public Dataset commitTransaction(Transaction transaction, boolean detached) {
+  public Dataset commitTransaction(
+      Transaction transaction, boolean detached, boolean enableV2ManifestPaths) {
     Preconditions.checkNotNull(transaction);
     try {
-      Dataset dataset = nativeCommitTransaction(transaction, detached);
+      Dataset dataset = nativeCommitTransaction(transaction, detached, enableV2ManifestPaths);
       if (selfManagedAllocator) {
         dataset.allocator = new RootAllocator(Long.MAX_VALUE);
       } else {
@@ -482,7 +484,8 @@ public class Dataset implements Closeable {
     }
   }
 
-  private native Dataset nativeCommitTransaction(Transaction transaction, boolean detached);
+  private native Dataset nativeCommitTransaction(
+      Transaction transaction, boolean detached, boolean enableV2ManifestPaths);
 
   /**
    * Drop a Dataset.
@@ -491,6 +494,26 @@ public class Dataset implements Closeable {
    * @param storageOptions Storage options
    */
   public static native void drop(String path, Map<String, String> storageOptions);
+
+  /**
+   * Migrate the manifest paths to the new format.
+   *
+   * <p>This will update the manifest to use the new v2 format for paths.
+   *
+   * <p>This function is idempotent, and can be run multiple times without changing the state of the
+   * object store.
+   *
+   * <p>DANGER: this should not be run while other concurrent operations are happening. And it
+   * should also run until completion before resuming other operations.
+   */
+  public void migrateManifestPathsV2() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeMigrateManifestPathsV2();
+    }
+  }
+
+  private native void nativeMigrateManifestPathsV2();
 
   /**
    * Add columns to the dataset.
@@ -731,6 +754,42 @@ public class Dataset implements Closeable {
 
   private native long nativeGetLatestVersionId();
 
+  /**
+   * Get the initial storage options used to open this dataset.
+   *
+   * <p>This returns the options that were provided when the dataset was opened, without any refresh
+   * from the provider. Returns null if no storage options were provided.
+   *
+   * @return the initial storage options, or null if none were provided
+   */
+  public Map<String, String> getInitialStorageOptions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetInitialStorageOptions();
+    }
+  }
+
+  private native Map<String, String> nativeGetInitialStorageOptions();
+
+  /**
+   * Get the latest storage options, potentially refreshed from the provider.
+   *
+   * <p>If a storage options provider was configured and credentials are expiring, this will refresh
+   * them.
+   *
+   * @return the latest storage options (static or refreshed from provider), or null if no storage
+   *     options were configured for this dataset
+   * @throws RuntimeException if an error occurs while fetching/refreshing options from the provider
+   */
+  public Map<String, String> getLatestStorageOptions() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetLatestStorageOptions();
+    }
+  }
+
+  private native Map<String, String> nativeGetLatestStorageOptions();
+
   /** Checkout the dataset to the latest version. */
   public void checkoutLatest() {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
@@ -796,16 +855,17 @@ public class Dataset implements Closeable {
    * @param name the name of the created index
    * @param params index params
    * @param replace whether to replace the existing index
+   * @return the metadata of the created index
    * @deprecated please use {@link Dataset#createIndex(IndexOptions)} instead.
    */
   @Deprecated
-  public void createIndex(
+  public Index createIndex(
       List<String> columns,
       IndexType indexType,
       Optional<String> name,
       IndexParams params,
       boolean replace) {
-    createIndex(
+    return createIndex(
         IndexOptions.builder(columns, indexType, params)
             .replace(replace)
             .withIndexName(name.orElse(null))
@@ -816,13 +876,14 @@ public class Dataset implements Closeable {
    * Creates a new index on the dataset.
    *
    * @param options options for building index
+   * @return the metadata of the created index
    */
-  public void createIndex(IndexOptions options) {
+  public Index createIndex(IndexOptions options) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeCreateIndex(
+      return nativeCreateIndex(
           options.getColumns(),
-          options.getIndexType().ordinal(),
+          options.getIndexType().getValue(),
           options.getIndexName(),
           options.getIndexParams(),
           options.isReplace(),
@@ -833,7 +894,7 @@ public class Dataset implements Closeable {
     }
   }
 
-  private native void nativeCreateIndex(
+  private native Index nativeCreateIndex(
       List<String> columns,
       int indexTypeCode,
       Optional<String> name,
@@ -1030,6 +1091,54 @@ public class Dataset implements Closeable {
   }
 
   private native List<Index> nativeGetIndexes();
+
+  /**
+   * Get statistics for a specific index in JSON form.
+   *
+   * <p>The JSON structure matches the Rust/Python index_statistics API.
+   *
+   * @param indexName the name of the index
+   * @return JSON string with index statistics
+   */
+  public Map<String, Object> getIndexStatistics(String indexName) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      String jsonDesc = nativeGetIndexStatistics(indexName);
+      return JsonUtils.fromJson(jsonDesc);
+    }
+  }
+
+  private native String nativeGetIndexStatistics(String indexName);
+
+  /**
+   * Describe indices on this dataset filtered by criteria.
+   *
+   * @param criteria filter options such as column, name or index capabilities
+   * @return list of index descriptions
+   */
+  public List<IndexDescription> describeIndices(IndexCriteria criteria) {
+    Preconditions.checkNotNull(criteria, "criteria cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndices(Optional.of(criteria));
+    }
+  }
+
+  /**
+   * Describe all indices on this dataset.
+   *
+   * @return list of index descriptions
+   */
+  public List<IndexDescription> describeIndices() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndices(Optional.empty());
+    }
+  }
+
+  private native List<IndexDescription> nativeDescribeIndices(Optional<IndexCriteria> criteria);
 
   /**
    * Get the table config of the dataset.
