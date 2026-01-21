@@ -130,15 +130,34 @@ pub struct BlobPreprocessor {
     data_file_key: String,
     local_counter: u32,
     pack_writer: PackWriter,
+    blob_v2_cols: Vec<bool>,
+    dedicated_thresholds: Vec<usize>,
+    writer_metadata: Vec<HashMap<String, String>>,
 }
 
 impl BlobPreprocessor {
-    pub(crate) fn new(object_store: ObjectStore, data_dir: Path, data_file_key: String) -> Self {
+    pub(crate) fn new(
+        object_store: ObjectStore,
+        data_dir: Path,
+        data_file_key: String,
+        schema: &lance_core::datatypes::Schema,
+    ) -> Self {
         let pack_writer = PackWriter::new(
             object_store.clone(),
             data_dir.clone(),
             data_file_key.clone(),
         );
+        let arrow_schema = arrow_schema::Schema::from(schema);
+        let fields = arrow_schema.fields();
+        let blob_v2_cols = fields.iter().map(|field| field.is_blob_v2()).collect();
+        let dedicated_thresholds = fields
+            .iter()
+            .map(|field| dedicated_threshold_from_metadata(field.as_ref()))
+            .collect();
+        let writer_metadata = fields
+            .iter()
+            .map(|field| field.metadata().clone())
+            .collect();
         Self {
             object_store,
             data_dir,
@@ -146,6 +165,9 @@ impl BlobPreprocessor {
             // Start at 1 to avoid a potential all-zero blob_id value.
             local_counter: 1,
             pack_writer,
+            blob_v2_cols,
+            dedicated_thresholds,
+            writer_metadata,
         }
     }
 
@@ -177,22 +199,32 @@ impl BlobPreprocessor {
             .await
     }
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let expected_columns = self.blob_v2_cols.len();
+        if batch.num_columns() != expected_columns {
+            return Err(Error::invalid_input(
+                format!(
+                    "Unexpected number of columns: expected {}, got {}",
+                    expected_columns,
+                    batch.num_columns()
+                ),
+                location!(),
+            ));
+        }
+
+        let batch_schema = batch.schema();
+        let batch_fields = batch_schema.fields();
+
         let mut new_columns = Vec::with_capacity(batch.num_columns());
         let mut new_fields = Vec::with_capacity(batch.num_columns());
 
-        for (array, field) in batch.columns().iter().zip(batch.schema().fields()) {
-            if !field.is_blob_v2() {
+        for idx in 0..batch.num_columns() {
+            let array = batch.column(idx);
+            let field = &batch_fields[idx];
+            if !self.blob_v2_cols[idx] {
                 new_columns.push(array.clone());
                 new_fields.push(field.clone());
                 continue;
             }
-
-            let dedicated_threshold = field
-                .metadata()
-                .get(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY)
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|&value| value > DEDICATED_THRESHOLD)
-                .unwrap_or(DEDICATED_THRESHOLD);
 
             let struct_arr = array
                 .as_any()
@@ -241,6 +273,7 @@ impl BlobPreprocessor {
                 let has_uri = !uri_col.is_null(i);
                 let data_len = if has_data { data_col.value(i).len() } else { 0 };
 
+                let dedicated_threshold = self.dedicated_thresholds[idx];
                 if has_data && data_len > dedicated_threshold {
                     let blob_id = self.next_blob_id();
                     self.write_dedicated(blob_id, data_col.value(i)).await?;
@@ -324,7 +357,7 @@ impl BlobPreprocessor {
                     ArrowDataType::Struct(child_fields.into()),
                     field.is_nullable(),
                 )
-                .with_metadata(field.metadata().clone()),
+                .with_metadata(self.writer_metadata[idx].clone()),
             ));
         }
 
@@ -333,7 +366,7 @@ impl BlobPreprocessor {
                 .iter()
                 .map(|f| f.as_ref().clone())
                 .collect::<Vec<_>>(),
-            batch.schema().metadata().clone(),
+            batch_schema.metadata().clone(),
         ));
 
         RecordBatch::try_new(new_schema, new_columns)
@@ -343,6 +376,16 @@ impl BlobPreprocessor {
     pub(crate) async fn finish(&mut self) -> Result<()> {
         self.pack_writer.finish().await
     }
+}
+
+fn dedicated_threshold_from_metadata(field: &arrow_schema::Field) -> usize {
+    field
+        .metadata()
+        .get(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY)
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(DEDICATED_THRESHOLD)
 }
 
 pub async fn preprocess_blob_batches(
@@ -816,9 +859,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::{DataTypeExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
+    use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_io::stream::RecordBatchStream;
 
-    use lance_core::datatypes::BlobKind;
     use lance_core::{utils::tempfile::TempStrDir, Error, Result};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_file::version::LanceFileVersion;
@@ -1132,108 +1175,74 @@ mod tests {
         assert_eq!(second.as_ref(), b"world");
     }
 
-    fn build_schema_with_meta(threshold_opt: Option<usize>) -> Arc<Schema> {
-        let mut blob_field_with_meta = blob_field("blob", true);
-        if let Some(threshold) = threshold_opt {
-            let mut metadata = blob_field_with_meta.metadata().clone();
-            metadata.insert(
-                BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
-                threshold.to_string(),
-            );
-            blob_field_with_meta = blob_field_with_meta.with_metadata(metadata);
-        }
+    async fn preprocess_kind_with_schema_metadata(metadata_value: &str, data_len: usize) -> u8 {
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory://blob_preprocessor",
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+        let object_store = object_store.as_ref().clone();
+        let data_dir = base_path.child("data");
 
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt32, false),
-            blob_field_with_meta,
-        ]))
-    }
+        let mut field = blob_field("blob", true);
+        let mut metadata = field.metadata().clone();
+        metadata.insert(
+            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+            metadata_value.to_string(),
+        );
+        field = field.with_metadata(metadata);
 
-    async fn write_then_get_blob_kinds(
-        blob_sizes: Vec<usize>,
-        threshold_opt: Option<usize>,
-    ) -> Vec<BlobKind> {
-        let test_dir = TempStrDir::default();
+        let writer_arrow_schema = Schema::new(vec![field.clone()]);
+        let writer_schema = lance_core::datatypes::Schema::try_from(&writer_arrow_schema).unwrap();
 
-        let mut blob_builder = BlobArrayBuilder::new(blob_sizes.len());
-        for size in &blob_sizes {
-            blob_builder.push_bytes(vec![0u8; *size]).unwrap();
-        }
-        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
-
-        let id_values: Vec<u32> = (0..blob_sizes.len() as u32).collect();
-        let id_array: arrow_array::ArrayRef = Arc::new(UInt32Array::from(id_values));
-
-        let schema = build_schema_with_meta(threshold_opt);
-
-        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
-        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-
-        let params = WriteParams::with_storage_version(LanceFileVersion::V2_2);
-        let dataset = Arc::new(
-            Dataset::write(reader, &test_dir, Some(params))
-                .await
-                .unwrap(),
+        let mut preprocessor = super::BlobPreprocessor::new(
+            object_store.clone(),
+            data_dir,
+            "data_file_key".to_string(),
+            &writer_schema,
         );
 
-        let indices: Vec<u64> = (0..blob_sizes.len() as u64).collect();
-        let blobs = dataset
-            .take_blobs_by_indices(&indices, "blob")
-            .await
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_bytes(vec![0u8; data_len]).unwrap();
+        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
+
+        let field_without_metadata =
+            Field::new("blob", field.data_type().clone(), field.is_nullable());
+        let batch_schema = Arc::new(Schema::new(vec![field_without_metadata]));
+        let batch = RecordBatch::try_new(batch_schema, vec![blob_array]).unwrap();
+
+        let out = preprocessor.preprocess_batch(&batch).await.unwrap();
+        let struct_arr = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
             .unwrap();
-
-        assert_eq!(blobs.len(), blob_sizes.len());
-
-        blobs.into_iter().map(|b| b.kind()).collect()
+        struct_arr
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<arrow::datatypes::UInt8Type>()
+            .value(0)
     }
 
     #[tokio::test]
     async fn test_blob_v2_dedicated_threshold_ignores_non_positive_metadata() {
-        let small_blob_len = super::DEDICATED_THRESHOLD / 2;
-        let large_blob_len = super::DEDICATED_THRESHOLD + 1;
-
-        // Sanity check assumptions for this test
-        assert!(small_blob_len > super::INLINE_MAX);
-
-        let cases = vec![(None, "no_metadata"), (Some(0), "zero_threshold")];
-
-        for (threshold_opt, label) in cases {
-            let kinds =
-                write_then_get_blob_kinds(vec![small_blob_len, large_blob_len], threshold_opt)
-                    .await;
-
-            assert_eq!(kinds.len(), 2, "case: {label}");
-            assert_eq!(kinds[0], BlobKind::Packed, "case: {label}");
-            assert_eq!(kinds[1], BlobKind::Dedicated, "case: {label}");
-        }
+        let kind = preprocess_kind_with_schema_metadata("0", 256 * 1024).await;
+        assert_eq!(kind, lance_core::datatypes::BlobKind::Packed as u8);
     }
 
     #[tokio::test]
     async fn test_blob_v2_dedicated_threshold_respects_smaller_metadata() {
-        let blob_len = super::DEDICATED_THRESHOLD / 2;
-        let overridden_threshold = super::DEDICATED_THRESHOLD / 4;
-
-        assert!(blob_len > super::INLINE_MAX);
-        assert!(overridden_threshold > 0);
-        assert!(blob_len > overridden_threshold);
-
-        let kinds = write_then_get_blob_kinds(vec![blob_len], Some(overridden_threshold)).await;
-
-        assert_eq!(kinds.len(), 1);
-        assert_eq!(kinds[0], BlobKind::Packed);
+        let kind = preprocess_kind_with_schema_metadata("131072", 256 * 1024).await;
+        assert_eq!(kind, lance_core::datatypes::BlobKind::Dedicated as u8);
     }
 
     #[tokio::test]
     async fn test_blob_v2_dedicated_threshold_respects_larger_metadata() {
-        let blob_len = super::DEDICATED_THRESHOLD + 1;
-        let overridden_threshold = super::DEDICATED_THRESHOLD * 2;
-
-        assert!(blob_len > super::INLINE_MAX);
-        assert!(blob_len < overridden_threshold);
-
-        let kinds = write_then_get_blob_kinds(vec![blob_len], Some(overridden_threshold)).await;
-
-        assert_eq!(kinds.len(), 1);
-        assert_eq!(kinds[0], BlobKind::Packed);
+        let kind =
+            preprocess_kind_with_schema_metadata("8388608", super::DEDICATED_THRESHOLD + 1024)
+                .await;
+        assert_eq!(kind, lance_core::datatypes::BlobKind::Packed as u8);
     }
 }

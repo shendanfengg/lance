@@ -858,6 +858,7 @@ pub async fn open_writer_with_options(
                     object_store.clone(),
                     data_dir.clone(),
                     data_file_key.clone(),
+                    schema,
                 ))
             } else {
                 None
