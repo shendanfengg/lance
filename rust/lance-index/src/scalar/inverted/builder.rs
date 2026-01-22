@@ -488,8 +488,6 @@ impl InnerBuilder {
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
-        let mut buffer = Vec::new();
-        let mut size_sum = 0;
         while let Some(batch) = rx.recv().await {
             let batch = batch?;
             num_posting_lists += 1;
